@@ -28,8 +28,8 @@ class Config:
     trades_csv: Path = Path("trades.csv")
     dry_run: bool = False
     roostoo_base: str = os.environ.get("ROOSTOO_BASE", "https://api.roostoo.com")
-    roostoo_api_key: Optional[str] = os.environ.get("ROOSTOO_API_KEY")
-    roostoo_api_secret: Optional[str] = os.environ.get("ROOSTOO_API_SECRET")
+    roostoo_api_key: str = "V5kL1wP6bT9oN7mC2gY4pH0lA3uS8nF1xD4eB7jM0qT2sK5zW8vT6yU3rI9hN7"
+    roostoo_api_secret: str = "B3nM7qW5eRtY1uI9oPaS2dF6gHjK4lL8ZxC0vBnM2qW6eRtY4uI0oPaS5dF7gHjK"
     max_position_usd: float = 1000.0
     order_notional_fraction: float = 0.5
 
