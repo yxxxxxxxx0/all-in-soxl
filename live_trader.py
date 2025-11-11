@@ -252,6 +252,9 @@ class CoinbaseDataHandler:
         self.session: Optional[aiohttp.ClientSession] = None
         self.product_id = to_provider_symbol("coinbase", cfg.symbol)
         self.base = "https://api.exchange.coinbase.com"
+        self.max_candles = 300
+        self.granularity = 60
+        self.max_span = timedelta(minutes=self.max_candles)  # 300 minutes = 5 hours
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -287,9 +290,9 @@ class CoinbaseDataHandler:
             return df
         return pd.DataFrame()
 
-    async def fetch_candles(self, start: Optional[datetime], end: Optional[datetime], granularity: int = 60):
+    async def fetch_candles(self, start: Optional[datetime], end: Optional[datetime]):
         assert self.session is not None
-        params = {"granularity": granularity}
+        params = {"granularity": self.granularity}
         if start and end:
             params["start"] = start.replace(tzinfo=UTC).isoformat()
             params["end"] = end.replace(tzinfo=UTC).isoformat()
@@ -307,6 +310,17 @@ class CoinbaseDataHandler:
             rows.sort(key=lambda r: r[0])
             return rows
 
+    async def _fetch_chunked(self, start_dt: datetime, end_dt: datetime):
+        cursor = start_dt
+        out: List[List[Any]] = []
+        while cursor < end_dt:
+            chunk_end = min(cursor + self.max_span, end_dt)
+            batch = await self.fetch_candles(cursor, chunk_end)
+            out.extend(batch)
+            cursor = chunk_end + timedelta(seconds=1)
+            await asyncio.sleep(0.15)
+        return out
+
     async def warmup(self):
         self._init_csv()
         df = self.load_csv()
@@ -314,22 +328,15 @@ class CoinbaseDataHandler:
         months_back = now_dt - timedelta(days=30*self.cfg.months_history)
         if df.empty:
             self.logger.info("Bootstrapping OHLCV from Coinbase REST...")
-            cursor = months_back
-            rows_all = []
-            while cursor < now_dt:
-                chunk_end = min(cursor + timedelta(days=5), now_dt)
-                batch = await self.fetch_candles(cursor, chunk_end, 60)
-                rows_all.extend(batch)
-                cursor = chunk_end + timedelta(seconds=1)
-                await asyncio.sleep(0.2)
+            rows_all = await self._fetch_chunked(months_back, now_dt)
             self.save_append(rows_all)
             df = self.load_csv()
         else:
             last_close = int(df.iloc[-1]["close_time"].timestamp() * 1000)
             last_dt = datetime.fromtimestamp(last_close/1000, tz=UTC)
             self.logger.info(f"Incrementally updating from {last_dt}...")
-            batch = await self.fetch_candles(last_dt + timedelta(milliseconds=1), now_dt, 60)
-            self.save_append(batch)
+            rows = await self._fetch_chunked(last_dt + timedelta(milliseconds=1), now_dt)
+            self.save_append(rows)
             df = self.load_csv()
         self.df = df
         return df
@@ -340,7 +347,7 @@ class CoinbaseDataHandler:
             try:
                 now_dt = datetime.now(tz=UTC)
                 since_dt = now_dt - timedelta(minutes=5)
-                batch = await self.fetch_candles(since_dt, now_dt, 60)
+                batch = await self.fetch_candles(since_dt, now_dt)
                 appended = None
                 for r in batch:
                     ot, opn, high, low, close, vol, ct = r
