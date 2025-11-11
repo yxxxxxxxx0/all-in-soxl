@@ -21,14 +21,15 @@ class Config:
     symbol: str = "BTCUSDT"
     interval: str = "1m"
     months_history: int = 3
+    provider: str = "binance"
     rest_base: str = "https://api.binance.com"
     ws_base: str = "wss://stream.binance.com:9443/ws"
     data_csv: Path = Path("data_1m.csv")
     trades_csv: Path = Path("trades.csv")
     dry_run: bool = False
     roostoo_base: str = os.environ.get("ROOSTOO_BASE", "https://api.roostoo.com")
-    roostoo_api_key: str = "V5kL1wP6bT9oN7mC2gY4pH0lA3uS8nF1xD4eB7jM0qT2sK5zW8vT6yU3rI9hN7"
-    roostoo_api_secret: str = "B3nM7qW5eRtY1uI9oPaS2dF6gHjK4lL8ZxC0vBnM2qW6eRtY4uI0oPaS5dF7gHjK"
+    roostoo_api_key: Optional[str] = os.environ.get("ROOSTOO_API_KEY")
+    roostoo_api_secret: Optional[str] = os.environ.get("ROOSTOO_API_SECRET")
     max_position_usd: float = 1000.0
     order_notional_fraction: float = 0.5
 
@@ -46,6 +47,18 @@ def to_dt(ms: int) -> datetime:
 
 def ensure_parent(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
+
+def to_provider_symbol(provider: str, symbol: str) -> str:
+    p = provider.lower()
+    if p == "coinbase":
+        if "-" in symbol:
+            return symbol
+        if symbol.endswith("USDT"):
+            return symbol[:-4] + "-USD"
+        if symbol.endswith("USD"):
+            return symbol[:-3] + "-USD"
+        return symbol + "-USD"
+    return symbol
 
 class TradeLogger:
     def __init__(self, csv_path: Path):
@@ -231,6 +244,123 @@ class BinanceDataHandler:
         self.df = pd.concat([self.df, s.to_frame().T], ignore_index=True)
         return s
 
+class CoinbaseDataHandler:
+    def __init__(self, cfg: Config, logger: logging.Logger):
+        self.cfg = cfg
+        self.logger = logger
+        self.df: pd.DataFrame = pd.DataFrame()
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.product_id = to_provider_symbol("coinbase", cfg.symbol)
+        self.base = "https://api.exchange.coinbase.com"
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self.session:
+            await self.session.close()
+
+    def _init_csv(self):
+        ensure_parent(self.cfg.data_csv)
+        if not self.cfg.data_csv.exists():
+            pd.DataFrame(columns=["open_time","open","high","low","close","volume","close_time"]).to_csv(self.cfg.data_csv, index=False)
+
+    def save_append(self, rows):
+        if not rows:
+            return
+        self._init_csv()
+        with self.cfg.data_csv.open("a", newline="") as f:
+            w = csv.writer(f)
+            for r in rows:
+                w.writerow(r)
+
+    def load_csv(self) -> pd.DataFrame:
+        if self.cfg.data_csv.exists():
+            df = pd.read_csv(self.cfg.data_csv)
+            for c in ["open_time","close_time"]:
+                df[c] = pd.to_datetime(df[c], unit="ms", utc=True)
+            for c in ["open","high","low","close","volume"]:
+                df[c] = df[c].astype(float)
+            df = df.sort_values("open_time").drop_duplicates(subset=["open_time"], keep="last").reset_index(drop=True)
+            self.logger.info(f"Loaded {len(df)} rows from {self.cfg.data_csv}")
+            return df
+        return pd.DataFrame()
+
+    async def fetch_candles(self, start: Optional[datetime], end: Optional[datetime], granularity: int = 60):
+        assert self.session is not None
+        params = {"granularity": granularity}
+        if start and end:
+            params["start"] = start.replace(tzinfo=UTC).isoformat()
+            params["end"] = end.replace(tzinfo=UTC).isoformat()
+        url = f"{self.base}/products/{self.product_id}/candles"
+        async with self.session.get(url, params=params, timeout=20) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"Coinbase candles error {resp.status}: {text}")
+            data = await resp.json()
+            rows = []
+            for t, low, high, opn, close, vol in data:
+                ot = int(t) * 1000
+                ct = ot + 60_000 - 1
+                rows.append([ot, opn, high, low, close, vol, ct])
+            rows.sort(key=lambda r: r[0])
+            return rows
+
+    async def warmup(self):
+        self._init_csv()
+        df = self.load_csv()
+        now_dt = datetime.now(tz=UTC)
+        months_back = now_dt - timedelta(days=30*self.cfg.months_history)
+        if df.empty:
+            self.logger.info("Bootstrapping OHLCV from Coinbase REST...")
+            cursor = months_back
+            rows_all = []
+            while cursor < now_dt:
+                chunk_end = min(cursor + timedelta(days=5), now_dt)
+                batch = await self.fetch_candles(cursor, chunk_end, 60)
+                rows_all.extend(batch)
+                cursor = chunk_end + timedelta(seconds=1)
+                await asyncio.sleep(0.2)
+            self.save_append(rows_all)
+            df = self.load_csv()
+        else:
+            last_close = int(df.iloc[-1]["close_time"].timestamp() * 1000)
+            last_dt = datetime.fromtimestamp(last_close/1000, tz=UTC)
+            self.logger.info(f"Incrementally updating from {last_dt}...")
+            batch = await self.fetch_candles(last_dt + timedelta(milliseconds=1), now_dt, 60)
+            self.save_append(batch)
+            df = self.load_csv()
+        self.df = df
+        return df
+
+    async def stream_like_minutes(self):
+        assert self.session is not None
+        while True:
+            try:
+                now_dt = datetime.now(tz=UTC)
+                since_dt = now_dt - timedelta(minutes=5)
+                batch = await self.fetch_candles(since_dt, now_dt, 60)
+                appended = None
+                for r in batch:
+                    ot, opn, high, low, close, vol, ct = r
+                    if self.df.empty or ot > int(self.df.iloc[-1]["open_time"].timestamp()*1000):
+                        self.save_append([r])
+                        s = pd.Series({
+                            "open_time": pd.to_datetime(ot, unit="ms", utc=True),
+                            "open": float(opn),"high": float(high),"low": float(low),
+                            "close": float(close),"volume": float(vol),
+                            "close_time": pd.to_datetime(ct, unit="ms", utc=True),
+                        })
+                        self.df = pd.concat([self.df, s.to_frame().T], ignore_index=True)
+                        appended = s
+                if appended is not None:
+                    yield {"k": {"x": True, "t": int(appended["open_time"].timestamp()*1000), "T": int(appended["close_time"].timestamp()*1000), "o": str(appended["open"]), "h": str(appended["high"]), "l": str(appended["low"]), "c": str(appended["close"]), "v": str(appended["volume"]) }}
+                await asyncio.sleep(5)
+            except Exception as e:
+                self.logger.error(f"Coinbase poll error: {e}; retrying in 5s")
+                await asyncio.sleep(5)
+
 class StrategyEngineBase:
     def on_new_candle(self, df: pd.DataFrame) -> Tuple[str, str]:
         raise NotImplementedError
@@ -327,56 +457,104 @@ class Trader:
         self.trade_logger = TradeLogger(cfg.trades_csv)
 
     async def run(self, strategy: StrategyEngineBase):
-        async with BinanceDataHandler(self.cfg, self.trade_logger.log) as data:
+        provider = self.cfg.provider.lower()
+        if provider == "coinbase":
+            data_ctx = CoinbaseDataHandler(self.cfg, self.trade_logger.log)
+        else:
+            data_ctx = BinanceDataHandler(self.cfg, self.trade_logger.log)
+        async with data_ctx as data:
             await data.warmup()
             async with aiohttp.ClientSession() as sess:
                 roostoo = RoostooClient(self.cfg, sess, self.trade_logger.log)
                 bal = await roostoo.get_balance()
                 strategy.update_account(balance_usd=bal.get("USD", 0.0), position_qty=getattr(roostoo, "sim_position_qty", 0.0))
-                async for msg in data.stream_klines():
-                    k = msg.get("k", {})
-                    if not k:
-                        continue
-                    appended = data.apply_closed_kline(msg)
-                    if appended is None:
-                        continue
-                    signal, reason = strategy.on_new_candle(data.df)
-                    self.trade_logger.log.info(f"Signal={signal} reason={reason} close={appended['close']:.2f}")
-                    if signal == "HOLD":
-                        continue
-                    bal = await roostoo.get_balance()
-                    balance_before = bal.get("USD", 0.0)
-                    position_before = getattr(roostoo, "sim_position_qty", 0.0)
-                    px = float(appended["close"])
-                    if signal == "BUY":
-                        target_notional = min(self.cfg.max_position_usd, balance_before * self.cfg.order_notional_fraction)
-                        qty = max(0.0, target_notional / px)
-                        side = "BUY"
-                    else:
-                        qty = max(0.0, getattr(roostoo, "sim_position_qty", 0.0))
-                        side = "SELL"
-                    if qty <= 0:
-                        self.trade_logger.log.info("Qty=0; skipping order")
-                        continue
-                    try:
-                        order = await roostoo.place_order(symbol=self.cfg.symbol, side=side, qty=qty, price=px)
-                        status = order.get("status", "UNKNOWN")
-                        filled = float(order.get("filledQty", qty))
-                        avg_price = float(order.get("avgPrice", px))
-                        bal_after = await roostoo.get_balance()
-                        balance_after = bal_after.get("USD", balance_before)
-                        position_after = getattr(roostoo, "sim_position_qty", position_before)
-                        strategy.update_account(balance_usd=balance_after, position_qty=position_after)
-                        self.trade_logger.record(
-                            timestamp=datetime.now(UTC), symbol=self.cfg.symbol, side=side, price=avg_price, qty=filled,
-                            reason=reason, balance_before=balance_before, balance_after=balance_after,
-                            position_before=position_before, position_after=position_after,
-                            order_id=str(order.get("orderId", "")), status=status
-                        )
-                    except Exception as e:
-                        self.trade_logger.log.error(f"Order failed: {e}")
-                    if self.stop_event.is_set():
-                        break
+                if provider == "coinbase":
+                    async for msg in data.stream_like_minutes():
+                        kd = msg.get("k", {})
+                        if not kd: continue
+                        appended = data.apply_closed_kline(msg) if hasattr(data, "apply_closed_kline") else None
+                        if appended is None and kd.get("x"):
+                            appended = pd.Series({
+                                "open_time": pd.to_datetime(kd["t"], unit="ms", utc=True),
+                                "close_time": pd.to_datetime(kd["T"], unit="ms", utc=True),
+                                "open": float(kd["o"]), "high": float(kd["h"]), "low": float(kd["l"]), "close": float(kd["c"]), "volume": float(kd["v"])
+                            })
+                        signal, reason = strategy.on_new_candle(data.df)
+                        self.trade_logger.log.info(f"Signal={signal} reason={reason} close={data.df.iloc[-1]['close']:.2f}")
+                        if signal == "HOLD": continue
+                        bal = await roostoo.get_balance()
+                        balance_before = bal.get("USD", 0.0)
+                        position_before = getattr(roostoo, "sim_position_qty", 0.0)
+                        px = float(data.df.iloc[-1]["close"])
+                        if signal == "BUY":
+                            target_notional = min(self.cfg.max_position_usd, balance_before * self.cfg.order_notional_fraction)
+                            qty = max(0.0, target_notional / px)
+                            side = "BUY"
+                        else:
+                            qty = max(0.0, getattr(roostoo, "sim_position_qty", 0.0))
+                            side = "SELL"
+                        if qty <= 0:
+                            self.trade_logger.log.info("Qty=0; skipping order")
+                            continue
+                        try:
+                            order = await roostoo.place_order(symbol=to_provider_symbol(provider, self.cfg.symbol), side=side, qty=qty, price=px)
+                            status = order.get("status", "UNKNOWN")
+                            filled = float(order.get("filledQty", qty))
+                            avg_price = float(order.get("avgPrice", px))
+                            bal_after = await roostoo.get_balance()
+                            balance_after = bal_after.get("USD", balance_before)
+                            position_after = getattr(roostoo, "sim_position_qty", position_before)
+                            strategy.update_account(balance_usd=balance_after, position_qty=position_after)
+                            self.trade_logger.record(
+                                timestamp=datetime.now(UTC), symbol=to_provider_symbol(provider, self.cfg.symbol), side=side, price=avg_price, qty=filled,
+                                reason=reason, balance_before=balance_before, balance_after=balance_after,
+                                position_before=position_before, position_after=position_after,
+                                order_id=str(order.get("orderId", "")), status=status
+                            )
+                        except Exception as e:
+                            self.trade_logger.log.error(f"Order failed: {e}")
+                        if self.stop_event.is_set(): break
+                else:
+                    async for msg in data.stream_klines():
+                        k = msg.get("k", {})
+                        if not k: continue
+                        appended = data.apply_closed_kline(msg)
+                        if appended is None: continue
+                        signal, reason = strategy.on_new_candle(data.df)
+                        self.trade_logger.log.info(f"Signal={signal} reason={reason} close={appended['close']:.2f}")
+                        if signal == "HOLD": continue
+                        bal = await roostoo.get_balance()
+                        balance_before = bal.get("USD", 0.0)
+                        position_before = getattr(roostoo, "sim_position_qty", 0.0)
+                        px = float(appended["close"])
+                        if signal == "BUY":
+                            target_notional = min(self.cfg.max_position_usd, balance_before * self.cfg.order_notional_fraction)
+                            qty = max(0.0, target_notional / px)
+                            side = "BUY"
+                        else:
+                            qty = max(0.0, getattr(roostoo, "sim_position_qty", 0.0))
+                            side = "SELL"
+                        if qty <= 0:
+                            self.trade_logger.log.info("Qty=0; skipping order")
+                            continue
+                        try:
+                            order = await roostoo.place_order(symbol=self.cfg.symbol, side=side, qty=qty, price=px)
+                            status = order.get("status", "UNKNOWN")
+                            filled = float(order.get("filledQty", qty))
+                            avg_price = float(order.get("avgPrice", px))
+                            bal_after = await roostoo.get_balance()
+                            balance_after = bal_after.get("USD", balance_before)
+                            position_after = getattr(roostoo, "sim_position_qty", position_before)
+                            strategy.update_account(balance_usd=balance_after, position_qty=position_after)
+                            self.trade_logger.record(
+                                timestamp=datetime.now(UTC), symbol=self.cfg.symbol, side=side, price=avg_price, qty=filled,
+                                reason=reason, balance_before=balance_before, balance_after=balance_after,
+                                position_before=position_before, position_after=position_after,
+                                order_id=str(order.get("orderId", "")), status=status
+                            )
+                        except Exception as e:
+                            self.trade_logger.log.error(f"Order failed: {e}")
+                        if self.stop_event.is_set(): break
 
     def request_stop(self, *_):
         self.trade_logger.log.info("Stop requested")
@@ -389,6 +567,7 @@ def parse_args(argv: Optional[List[str]] = None) -> Config:
     p.add_argument("--symbol", default=os.environ.get("SYMBOL", "BTCUSDT"))
     p.add_argument("--interval", default=os.environ.get("INTERVAL", "1m"))
     p.add_argument("--months", type=int, default=int(os.environ.get("MONTHS", 3)))
+    p.add_argument("--provider", default=os.environ.get("PROVIDER", "binance"))
     p.add_argument("--data-csv", default=os.environ.get("DATA_CSV", "data_1m.csv"))
     p.add_argument("--trades-csv", default=os.environ.get("TRADES_CSV", "trades.csv"))
     p.add_argument("--dry-run", action="store_true")
@@ -400,6 +579,7 @@ def parse_args(argv: Optional[List[str]] = None) -> Config:
         symbol=args.symbol,
         interval=args.interval,
         months_history=args.months,
+        provider=args.provider,
         data_csv=Path(args.data_csv),
         trades_csv=Path(args.trades_csv),
         dry_run=args.dry_run,
