@@ -18,7 +18,7 @@ from dateutil import tz
 
 @dc.dataclass
 class Config:
-    symbol: str = "BTCUSDT"
+    symbol: str = "BTCUSD"
     interval: str = "1m"
     months_history: int = 3
     provider: str = "binance"
