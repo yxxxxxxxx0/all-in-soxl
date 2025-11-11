@@ -476,7 +476,43 @@ class Trader:
                 bal = await roostoo.get_balance()
                 strategy.update_account(balance_usd=bal.get("USD", 0.0), position_qty=getattr(roostoo, "sim_position_qty", 0.0))
                 if provider == "coinbase":
-                    async for msg in data.stream_like_minutes():
+                    
+        # --- DEMO block: simulate a $100 BUY -> SELL to verify system startup ---
+        if self.cfg.dry_run:
+            self.trade_logger.log.info("Simulating $100 BUY -> SELL to verify system startup")
+            fake_price = 100.0  # or data.df.iloc[-1]['close']
+            fake_qty = 1.0
+            self.trade_logger.record(
+                timestamp=datetime.now(UTC),
+                symbol=self.cfg.symbol,
+                side="BUY",
+                price=fake_price,
+                qty=fake_qty,
+                reason="startup_test",
+                balance_before=0,
+                balance_after=0,
+                position_before=0,
+                position_after=0,
+                order_id="SIM-BUY",
+                status="FILLED",
+            )
+            self.trade_logger.record(
+                timestamp=datetime.now(UTC),
+                symbol=self.cfg.symbol,
+                side="SELL",
+                price=fake_price,
+                qty=fake_qty,
+                reason="startup_test",
+                balance_before=0,
+                balance_after=0,
+                position_before=0,
+                position_after=0,
+                order_id="SIM-SELL",
+                status="FILLED",
+            )
+        # --- end of DEMO block ---
+
+                        async for msg in data.stream_like_minutes():
                         kd = msg.get("k", {})
                         if not kd: continue
                         appended = data.apply_closed_kline(msg) if hasattr(data, "apply_closed_kline") else None
